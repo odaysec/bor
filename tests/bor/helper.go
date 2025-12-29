@@ -571,10 +571,21 @@ func InitGenesis(t *testing.T, faucets []*ecdsa.PrivateKey, fileLocation string,
 }
 
 func InitMiner(genesis *core.Genesis, privKey *ecdsa.PrivateKey, withoutHeimdall bool) (*node.Node, *eth.Ethereum, error) {
-	return InitMinerWithBlockTime(genesis, privKey, withoutHeimdall, 0)
+	return InitMinerWithOptions(genesis, privKey, withoutHeimdall, 0, nil)
+}
+
+// InitMinerWithHeimdall creates a miner node with a mock HeimdallClient injected during initialization.
+// This is the preferred way to test with mock Heimdall clients as it avoids caching issues.
+func InitMinerWithHeimdall(genesis *core.Genesis, privKey *ecdsa.PrivateKey, heimdallClient bor.IHeimdallClient) (*node.Node, *eth.Ethereum, error) {
+	return InitMinerWithOptions(genesis, privKey, false, 0, heimdallClient)
 }
 
 func InitMinerWithBlockTime(genesis *core.Genesis, privKey *ecdsa.PrivateKey, withoutHeimdall bool, blockTime time.Duration) (*node.Node, *eth.Ethereum, error) {
+	return InitMinerWithOptions(genesis, privKey, withoutHeimdall, blockTime, nil)
+}
+
+// InitMinerWithOptions is the base function for creating miner nodes with various options.
+func InitMinerWithOptions(genesis *core.Genesis, privKey *ecdsa.PrivateKey, withoutHeimdall bool, blockTime time.Duration, heimdallClient bor.IHeimdallClient) (*node.Node, *eth.Ethereum, error) {
 	// Define the basic configurations for the Ethereum node
 	datadir, err := os.MkdirTemp("", "InitMiner-"+uuid.New().String())
 	if err != nil {
@@ -599,13 +610,13 @@ func InitMinerWithBlockTime(genesis *core.Genesis, privKey *ecdsa.PrivateKey, wi
 	}
 
 	ethBackend, err := eth.New(stack, &ethconfig.Config{
-		Genesis:         genesis,
-		NetworkId:       genesis.Config.ChainID.Uint64(),
-		SyncMode:        downloader.FullSync,
-		DatabaseCache:   256,
-		DatabaseHandles: 256,
-		TxPool:          legacypool.DefaultConfig,
-		GPO:             ethconfig.Defaults.GPO,
+		Genesis:                genesis,
+		NetworkId:              genesis.Config.ChainID.Uint64(),
+		SyncMode:               downloader.FullSync,
+		DatabaseCache:          256,
+		DatabaseHandles:        256,
+		TxPool:                 legacypool.DefaultConfig,
+		GPO:                    ethconfig.Defaults.GPO,
 		Miner: miner.Config{
 			Etherbase: crypto.PubkeyToAddress(privKey.PublicKey),
 			GasCeil:   genesis.GasLimit * 11 / 10,
@@ -613,7 +624,8 @@ func InitMinerWithBlockTime(genesis *core.Genesis, privKey *ecdsa.PrivateKey, wi
 			Recommit:  time.Second,
 			BlockTime: blockTime,
 		},
-		WithoutHeimdall: withoutHeimdall,
+		WithoutHeimdall:        withoutHeimdall,
+		OverrideHeimdallClient: heimdallClient,
 	})
 
 	if err != nil {
