@@ -515,6 +515,7 @@ func (t *TrieDB) CommitWithWitness(collectLeaf bool) (common.Hash, *Witness, *tr
 
 // Witness returns the witness from the last CommitWithWitness call.
 // Returns nil if CommitWithWitness has not been called or if there were no changes.
+// The returned map contains RLP-encoded trie nodes as keys (matching the standard trie format).
 func (t *TrieDB) Witness() map[string]struct{} {
 	if t.lastWitness == nil {
 		return nil
@@ -526,10 +527,11 @@ func (t *TrieDB) Witness() map[string]struct{} {
 		return nil
 	}
 
-	// Convert to the expected format (set of node hashes as hex strings)
+	// Convert to the expected format: RLP-encoded node data as keys
+	// This matches the standard trie.Witness() format used by stateless.Witness.AddState()
 	result := make(map[string]struct{}, len(nodes))
 	for _, node := range nodes {
-		result[node.Hash.Hex()] = struct{}{}
+		result[string(node.Data)] = struct{}{}
 	}
 	return result
 }
