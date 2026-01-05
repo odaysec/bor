@@ -5,12 +5,18 @@ FROM golang:1.25-alpine AS builder
 
 ARG BOR_DIR=/var/lib/bor/
 ENV BOR_DIR=$BOR_DIR
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 RUN apk add --no-cache build-base git linux-headers curl
 
-# Install Rust toolchain for building triedb-ffi
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-ENV PATH="/root/.cargo/bin:${PATH}"
+# Install Rust toolchain with cache mount to avoid re-downloading on every build
+RUN --mount=type=cache,target=/usr/local/rustup \
+    --mount=type=cache,target=/usr/local/cargo \
+    if [ ! -f /usr/local/cargo/bin/rustc ]; then \
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path; \
+    fi
 
 WORKDIR /var/lib/
 
@@ -24,7 +30,9 @@ WORKDIR ${BOR_DIR}
 RUN --mount=type=ssh \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/rustup \
+    --mount=type=cache,target=/usr/local/cargo \
     git submodule update --init --recursive && \
     go mod download && \
     make bor
