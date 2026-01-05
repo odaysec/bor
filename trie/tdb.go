@@ -22,6 +22,8 @@ type (
 	TransactionRW = triedb.TransactionRW
 	Address       = triedb.Address
 	Hash          = triedb.Hash
+	Witness       = triedb.Witness
+	WitnessNode   = triedb.WitnessNode
 )
 
 // Re-export functions
@@ -114,6 +116,9 @@ type TrieDB struct {
 
 	// Last computed root (for optimization when no new changes)
 	lastComputedRoot common.Hash
+
+	// Last generated witness (set by CommitWithWitness)
+	lastWitness *Witness
 }
 
 // NewTrieDB creates a new Trie implementation using triedb-go
@@ -134,6 +139,7 @@ func NewTrieDB(root common.Hash, db *Database) (*TrieDB, error) {
 		committedAccounts: make(map[Address]*types.StateAccount),
 		committedStorage:  make(map[Address]map[Hash][]byte),
 		lastComputedRoot:  root,
+		lastWitness:       nil,
 	}, nil
 }
 
@@ -207,6 +213,7 @@ func (t *TrieDB) Copy() *TrieDB {
 		committedAccounts: committedAccounts,
 		committedStorage:  committedStorage,
 		lastComputedRoot:  t.lastComputedRoot,
+		lastWitness:       nil, // Witness is not copied, must be regenerated
 	}
 }
 
@@ -439,11 +446,26 @@ func (t *TrieDB) Hash() common.Hash {
 }
 
 // Commit computes the new state root by applying the overlay changes
-// Note: This does NOT persist changes to the database, it only computes the new root
+// and generates a witness containing all trie nodes accessed during the computation.
+// Note: This does NOT persist changes to the database, it only computes the new root.
 func (t *TrieDB) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
-	// Optimization: if no new changes since last commit, return cached root
+	root, _, _ := t.CommitWithWitness(collectLeaf)
+	return root, nil
+}
+
+// CommitWithWitness computes the new state root and generates a witness
+// containing all trie nodes accessed during the computation.
+// This is used for stateless verification of state transitions.
+func (t *TrieDB) CommitWithWitness(collectLeaf bool) (common.Hash, *Witness, *trienode.NodeSet) {
+	// Close any previous witness
+	if t.lastWitness != nil {
+		t.lastWitness.Close()
+		t.lastWitness = nil
+	}
+
+	// Optimization: if no new changes since last commit, return cached root with empty witness
 	if len(t.accounts) == 0 && len(t.storage) == 0 {
-		return t.lastComputedRoot, nil
+		return t.lastComputedRoot, nil, nil
 	}
 
 	// Merge uncommitted changes into committed buffers
@@ -467,34 +489,80 @@ func (t *TrieDB) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet) {
 	overlay, err := t.buildOverlay()
 	if err != nil {
 		log.Error("Failed to build overlay", "err", err)
-		return t.root, nil
+		return t.root, nil, nil
 	}
 	defer overlay.Close()
 
 	tx, err := t.db.BeginRO()
 	if err != nil {
 		log.Error("Failed to begin read-only transaction", "err", err)
-		return t.root, nil
+		return t.root, nil, nil
 	}
 	defer tx.Commit()
 
-	root, err := tx.ComputeRootWithOverlay(overlay)
+	root, witness, err := tx.ComputeRootWithOverlayAndWitness(overlay)
 	if err != nil {
-		log.Error("Failed to compute root with overlay", "err", err)
-		return t.root, nil
+		log.Error("Failed to compute root with overlay and witness", "err", err)
+		return t.root, nil, nil
 	}
 
-	// Cache the computed root for future calls with no changes
+	// Cache the computed root and witness
 	t.lastComputedRoot = common.Hash(root)
+	t.lastWitness = witness
 
-	return t.lastComputedRoot, nil
+	return t.lastComputedRoot, witness, nil
 }
 
-// Witness returns the set of accessed trie nodes
-// TODO: Placeholder - not yet implemented
+// Witness returns the witness from the last CommitWithWitness call.
+// Returns nil if CommitWithWitness has not been called or if there were no changes.
 func (t *TrieDB) Witness() map[string]struct{} {
-	// Placeholder implementation
-	return nil
+	if t.lastWitness == nil {
+		return nil
+	}
+
+	nodes, err := t.lastWitness.Nodes()
+	if err != nil {
+		log.Error("Failed to get witness nodes", "err", err)
+		return nil
+	}
+
+	// Convert to the expected format (set of node hashes as hex strings)
+	result := make(map[string]struct{}, len(nodes))
+	for _, node := range nodes {
+		result[node.Hash.Hex()] = struct{}{}
+	}
+	return result
+}
+
+// GetWitness returns the raw witness from the last CommitWithWitness call.
+// This provides direct access to the witness data including node RLP.
+func (t *TrieDB) GetWitness() *Witness {
+	return t.lastWitness
+}
+
+// GetWitnessNodes returns all witness nodes from the last CommitWithWitness call.
+// Each node contains its hash and RLP-encoded data.
+func (t *TrieDB) GetWitnessNodes() ([]WitnessNode, error) {
+	if t.lastWitness == nil {
+		return nil, nil
+	}
+	return t.lastWitness.Nodes()
+}
+
+// SerializeWitness serializes the witness for transmission or storage.
+func (t *TrieDB) SerializeWitness() ([]byte, error) {
+	if t.lastWitness == nil {
+		return nil, nil
+	}
+	return t.lastWitness.Serialize()
+}
+
+// ClearWitness releases the witness resources.
+func (t *TrieDB) ClearWitness() {
+	if t.lastWitness != nil {
+		t.lastWitness.Close()
+		t.lastWitness = nil
+	}
 }
 
 // NodeIterator returns an iterator for trie nodes

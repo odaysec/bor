@@ -31,9 +31,9 @@ init-submodules:
 
 #? build-triedb-ffi: Build the TrieDB FFI library from Rust source
 .PHONY: build-triedb-ffi
-build-triedb-ffi: init-submodules
+build-triedb-ffi:
 	@echo "Building TrieDB FFI library..."
-	cd triedb-go/triedb-ffi && cargo build --release
+	cd triedb-go/triedb-ffi && cargo fmt && cargo build --release
 	@echo "TrieDB FFI library built successfully."
 
 bor: build-triedb-ffi
