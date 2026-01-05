@@ -1,4 +1,6 @@
 # ─── BUILDER STAGE ───────────────────────────────────────────────────────────────
+# NOTE: Build from parent directory containing both bor/ and triedb/:
+# cd /path/to/polygon && docker build -t bor:kamui-triedb-witness -f bor/Dockerfile .
 FROM golang:1.25-alpine AS builder
 
 ARG BOR_DIR=/var/lib/bor/
@@ -10,9 +12,13 @@ RUN apk add --no-cache build-base git linux-headers curl
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-WORKDIR ${BOR_DIR}
+WORKDIR /var/lib/
 
-COPY . .
+# Copy both bor and triedb directories (build context should be parent directory)
+COPY bor/ bor/
+COPY triedb/ triedb/
+
+WORKDIR ${BOR_DIR}
 
 # Initialize git submodules, download Go dependencies, and build (includes triedb-ffi)
 RUN --mount=type=ssh \
