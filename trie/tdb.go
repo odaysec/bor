@@ -114,6 +114,12 @@ type TrieDB struct {
 	committedAccounts map[Address]*types.StateAccount
 	committedStorage  map[Address]map[Hash][]byte
 
+	// Track accounts and storage read from base state (for witness generation).
+	// These are accounts/storage that were read but not modified during block execution.
+	// They need to be included in the overlay so their trie nodes are part of the witness.
+	readAccounts map[Address]*types.StateAccount
+	readStorage  map[Address]map[Hash][]byte
+
 	// Last computed root (for optimization when no new changes)
 	lastComputedRoot common.Hash
 
@@ -138,6 +144,8 @@ func NewTrieDB(root common.Hash, db *Database) (*TrieDB, error) {
 		storage:           make(map[Address]map[Hash][]byte),
 		committedAccounts: make(map[Address]*types.StateAccount),
 		committedStorage:  make(map[Address]map[Hash][]byte),
+		readAccounts:      make(map[Address]*types.StateAccount),
+		readStorage:       make(map[Address]map[Hash][]byte),
 		lastComputedRoot:  root,
 		lastWitness:       nil,
 	}, nil
@@ -205,6 +213,35 @@ func (t *TrieDB) Copy() *TrieDB {
 		}
 	}
 
+	// Deep copy readAccounts
+	readAccounts := make(map[Address]*types.StateAccount, len(t.readAccounts))
+	for addr, acc := range t.readAccounts {
+		if acc != nil {
+			accCopy := *acc
+			readAccounts[addr] = &accCopy
+		} else {
+			readAccounts[addr] = nil
+		}
+	}
+
+	// Deep copy readStorage
+	readStorage := make(map[Address]map[Hash][]byte, len(t.readStorage))
+	for addr, slots := range t.readStorage {
+		if slots != nil {
+			slotsCopy := make(map[Hash][]byte, len(slots))
+			for slot, value := range slots {
+				if value != nil {
+					valueCopy := make([]byte, len(value))
+					copy(valueCopy, value)
+					slotsCopy[slot] = valueCopy
+				} else {
+					slotsCopy[slot] = nil
+				}
+			}
+			readStorage[addr] = slotsCopy
+		}
+	}
+
 	return &TrieDB{
 		db:                t.db,
 		root:              t.root,
@@ -212,6 +249,8 @@ func (t *TrieDB) Copy() *TrieDB {
 		storage:           storage,
 		committedAccounts: committedAccounts,
 		committedStorage:  committedStorage,
+		readAccounts:      readAccounts,
+		readStorage:       readStorage,
 		lastComputedRoot:  t.lastComputedRoot,
 		lastWitness:       nil, // Witness is not copied, must be regenerated
 	}
@@ -230,19 +269,19 @@ func (t *TrieDB) GetAccount(address common.Address) (*types.StateAccount, error)
 
 	// Check uncommitted changes first
 	if acc, exists := t.accounts[addr]; exists {
-		if acc == nil {
-			// Account was deleted
-			return nil, ErrAccountNotFound
-		}
+		// nil means deleted or non-existent, return nil without error
 		return acc, nil
 	}
 
 	// Check committed buffer next
 	if acc, exists := t.committedAccounts[addr]; exists {
-		if acc == nil {
-			// Account was deleted
-			return nil, ErrAccountNotFound
-		}
+		// nil means deleted or non-existent, return nil without error
+		return acc, nil
+	}
+
+	// Check if we already read this account from base state
+	if acc, exists := t.readAccounts[addr]; exists {
+		// nil means non-existent, return nil without error
 		return acc, nil
 	}
 
@@ -255,9 +294,19 @@ func (t *TrieDB) GetAccount(address common.Address) (*types.StateAccount, error)
 
 	acc, err := tx.GetAccount(addr)
 	if err != nil {
+		// Account not found is not an error - it means the account doesn't exist
+		if err == ErrAccountNotFound {
+			t.readAccounts[addr] = nil
+			return nil, nil
+		}
 		return nil, err
 	}
-	return ToStateAccount(acc), nil
+
+	// Track account read for witness generation
+	stateAcc := ToStateAccount(acc)
+	t.readAccounts[addr] = stateAcc
+
+	return stateAcc, nil
 }
 
 // GetStorage retrieves a storage value from the trie
@@ -292,6 +341,16 @@ func (t *TrieDB) GetStorage(addr common.Address, key []byte) ([]byte, error) {
 		}
 	}
 
+	// Check if we already read this storage slot from base state
+	if addrStorage, exists := t.readStorage[address]; exists {
+		if value, exists := addrStorage[slot]; exists {
+			if len(value) == 0 {
+				return nil, nil
+			}
+			return value, nil
+		}
+	}
+
 	// Read from base state using a temporary transaction
 	tx, err := t.db.BeginRO()
 	if err != nil {
@@ -301,12 +360,31 @@ func (t *TrieDB) GetStorage(addr common.Address, key []byte) ([]byte, error) {
 
 	value, err := tx.GetStorage(address, slot)
 	if err != nil {
+		// Storage not found is not an error - it means the slot doesn't exist
+		if err == ErrStorageNotFound {
+			if t.readStorage[address] == nil {
+				t.readStorage[address] = make(map[Hash][]byte)
+			}
+			t.readStorage[address][slot] = nil
+			return nil, nil
+		}
 		return nil, err
 	}
+
+	// Track storage read for witness generation
+	if t.readStorage[address] == nil {
+		t.readStorage[address] = make(map[Hash][]byte)
+	}
 	if value == nil {
+		t.readStorage[address][slot] = nil
 		return nil, nil
 	}
-	return (*value)[:], nil
+	// Store a copy of the value
+	valueCopy := make([]byte, len(*value))
+	copy(valueCopy, (*value)[:])
+	t.readStorage[address][slot] = valueCopy
+
+	return valueCopy, nil
 }
 
 // UpdateAccount updates an account in the trie
@@ -394,6 +472,7 @@ func (t *TrieDB) UpdateContractCode(address common.Address, codeHash common.Hash
 }
 
 // buildOverlay creates an overlay state from the committed changes buffer
+// and includes read-only accounts/storage for witness generation.
 func (t *TrieDB) buildOverlay() (*triedb.OverlayState, error) {
 	overlay, err := triedb.NewOverlayState()
 	if err != nil {
@@ -419,6 +498,52 @@ func (t *TrieDB) buildOverlay() (*triedb.OverlayState, error) {
 				}
 			} else {
 				// Update - convert value to uint256.Int
+				var valBytes [32]byte
+				if len(value) > 32 {
+					overlay.Close()
+					return nil, fmt.Errorf("storage value too large: %d bytes", len(value))
+				}
+				copy(valBytes[32-len(value):], value)
+				valInt := new(uint256.Int)
+				valInt.SetBytes(valBytes[:])
+
+				if err := overlay.InsertStorage(addr, slot, valInt); err != nil {
+					overlay.Close()
+					return nil, err
+				}
+			}
+		}
+	}
+
+	// Insert read-only accounts (accounts read from base state but not modified).
+	// These are included so their trie nodes appear in the witness.
+	for addr, acc := range t.readAccounts {
+		// Skip if this account was already in committed buffer (it was modified)
+		if _, exists := t.committedAccounts[addr]; exists {
+			continue
+		}
+		if err := overlay.InsertAccount(addr, FromStateAccount(acc)); err != nil {
+			overlay.Close()
+			return nil, err
+		}
+	}
+
+	// Insert read-only storage (storage slots read from base state but not modified).
+	// These are included so their trie nodes appear in the witness.
+	for addr, slots := range t.readStorage {
+		for slot, value := range slots {
+			// Skip if this storage slot was already in committed buffer (it was modified)
+			if addrStorage, exists := t.committedStorage[addr]; exists {
+				if _, exists := addrStorage[slot]; exists {
+					continue
+				}
+			}
+			if len(value) == 0 {
+				if err := overlay.InsertStorage(addr, slot, nil); err != nil {
+					overlay.Close()
+					return nil, err
+				}
+			} else {
 				var valBytes [32]byte
 				if len(value) > 32 {
 					overlay.Close()
@@ -463,8 +588,12 @@ func (t *TrieDB) CommitWithWitness(collectLeaf bool) (common.Hash, *Witness, *tr
 		t.lastWitness = nil
 	}
 
-	// Optimization: if no new changes since last commit, return cached root with empty witness
-	if len(t.accounts) == 0 && len(t.storage) == 0 {
+	// Check if we have any work to do (changes or reads to include in witness)
+	hasChanges := len(t.accounts) > 0 || len(t.storage) > 0
+	hasReads := len(t.readAccounts) > 0 || len(t.readStorage) > 0
+
+	// Optimization: if no changes and no reads since last commit, return cached root
+	if !hasChanges && !hasReads && len(t.committedAccounts) == 0 && len(t.committedStorage) == 0 {
 		return t.lastComputedRoot, nil, nil
 	}
 
@@ -485,7 +614,7 @@ func (t *TrieDB) CommitWithWitness(collectLeaf bool) (common.Hash, *Witness, *tr
 	t.accounts = make(map[Address]*types.StateAccount)
 	t.storage = make(map[Address]map[Hash][]byte)
 
-	// Build overlay from committed buffers
+	// Build overlay from committed buffers (includes read-only accounts/storage)
 	overlay, err := t.buildOverlay()
 	if err != nil {
 		log.Error("Failed to build overlay", "err", err)
@@ -509,6 +638,10 @@ func (t *TrieDB) CommitWithWitness(collectLeaf bool) (common.Hash, *Witness, *tr
 	// Cache the computed root and witness
 	t.lastComputedRoot = common.Hash(root)
 	t.lastWitness = witness
+
+	// Clear read tracking for the next block
+	t.readAccounts = make(map[Address]*types.StateAccount)
+	t.readStorage = make(map[Address]map[Hash][]byte)
 
 	return t.lastComputedRoot, witness, nil
 }
@@ -584,4 +717,74 @@ func (t *TrieDB) Prove(key []byte, proofDb ethdb.KeyValueWriter) error {
 // IsVerkle returns false as this is not a Verkle trie
 func (t *TrieDB) IsVerkle() bool {
 	return false
+}
+
+// MergeReadsFrom merges the read tracking data from another TrieDB instance.
+// This is used to combine reads from the reader path with the commit path
+// for complete witness generation. Only accounts/storage that were read
+// (not modified) in the other trie are merged.
+func (t *TrieDB) MergeReadsFrom(other *TrieDB) {
+	if other == nil {
+		return
+	}
+
+	// Merge readAccounts from other trie
+	for addr, acc := range other.readAccounts {
+		// Skip if already tracked in this trie (either as read, committed, or uncommitted)
+		if _, exists := t.readAccounts[addr]; exists {
+			continue
+		}
+		if _, exists := t.committedAccounts[addr]; exists {
+			continue
+		}
+		if _, exists := t.accounts[addr]; exists {
+			continue
+		}
+		// Copy the account (deep copy if not nil)
+		if acc != nil {
+			accCopy := *acc
+			t.readAccounts[addr] = &accCopy
+		} else {
+			t.readAccounts[addr] = nil
+		}
+	}
+
+	// Merge readStorage from other trie
+	for addr, slots := range other.readStorage {
+		if slots == nil {
+			continue
+		}
+		for slot, value := range slots {
+			// Skip if already tracked in this trie
+			if addrStorage, exists := t.readStorage[addr]; exists {
+				if _, exists := addrStorage[slot]; exists {
+					continue
+				}
+			}
+			if addrStorage, exists := t.committedStorage[addr]; exists {
+				if _, exists := addrStorage[slot]; exists {
+					continue
+				}
+			}
+			if addrStorage, exists := t.storage[addr]; exists {
+				if _, exists := addrStorage[slot]; exists {
+					continue
+				}
+			}
+
+			// Initialize storage map for this address if needed
+			if t.readStorage[addr] == nil {
+				t.readStorage[addr] = make(map[Hash][]byte)
+			}
+
+			// Copy the value (deep copy if not nil)
+			if value != nil {
+				valueCopy := make([]byte, len(value))
+				copy(valueCopy, value)
+				t.readStorage[addr][slot] = valueCopy
+			} else {
+				t.readStorage[addr][slot] = nil
+			}
+		}
+	}
 }

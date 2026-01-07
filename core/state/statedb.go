@@ -1411,6 +1411,17 @@ func (s *StateDB) IntermediateRoot(deleteEmptyObjects bool) common.Hash {
 	// Track the amount of time wasted on hashing the account trie
 	defer func(start time.Time) { s.AccountHashes += time.Since(start) }(time.Now())
 
+	// In TDB mode, merge read tracking from the reader's TrieDB into the commit TrieDB
+	// before computing the hash. This ensures reads captured by the reader path are
+	// included in the witness generation.
+	if s.db.TrieDB().IsUsingTDB() {
+		if commitTrie, ok := s.trie.(*trie.TrieDB); ok {
+			if readerTrie := ExtractTrieDB(s.reader); readerTrie != nil {
+				commitTrie.MergeReadsFrom(readerTrie)
+			}
+		}
+	}
+
 	hash := s.trie.Hash()
 
 	// If witness building is enabled, gather the account trie witness

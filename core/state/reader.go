@@ -287,6 +287,15 @@ func (r *trieReader) Account(addr common.Address) (*types.StateAccount, error) {
 	return r.account(addr)
 }
 
+// GetTrieDB returns the underlying TrieDB if this reader uses one, nil otherwise.
+// This is used for merging read tracking data for witness generation.
+func (r *trieReader) GetTrieDB() *trie.TrieDB {
+	if tdb, ok := r.mainTrie.(*trie.TrieDB); ok {
+		return tdb
+	}
+	return nil
+}
+
 // Storage implements StateReader, retrieving the storage slot specified by the
 // address and slot key.
 //
@@ -395,6 +404,19 @@ func (r *multiStateReader) Storage(addr common.Address, slot common.Hash) (commo
 	return common.Hash{}, errors.Join(errs...)
 }
 
+// GetTrieDB returns the underlying TrieDB from any trieReader in this multi reader.
+// Returns nil if no TrieDB is found.
+func (r *multiStateReader) GetTrieDB() *trie.TrieDB {
+	for _, reader := range r.readers {
+		if tr, ok := reader.(*trieReader); ok {
+			if tdb := tr.GetTrieDB(); tdb != nil {
+				return tdb
+			}
+		}
+	}
+	return nil
+}
+
 // reader is the wrapper of ContractCodeReader and StateReader interface.
 type reader struct {
 	ContractCodeReader
@@ -407,6 +429,18 @@ func newReader(codeReader ContractCodeReader, stateReader StateReader) *reader {
 		ContractCodeReader: codeReader,
 		StateReader:        stateReader,
 	}
+}
+
+// GetTrieDB returns the underlying TrieDB from the state reader if available.
+// Returns nil if no TrieDB is found.
+func (r *reader) GetTrieDB() *trie.TrieDB {
+	if msr, ok := r.StateReader.(*multiStateReader); ok {
+		return msr.GetTrieDB()
+	}
+	if tr, ok := r.StateReader.(*trieReader); ok {
+		return tr.GetTrieDB()
+	}
+	return nil
 }
 
 // readerWithCache is a wrapper around Reader that maintains additional state caches
@@ -577,4 +611,31 @@ func (r *readerWithCacheStats) GetStats() ReaderStats {
 		StorageHit:  r.storageHit.Load(),
 		StorageMiss: r.storageMiss.Load(),
 	}
+}
+
+// ExtractTrieDB extracts the underlying TrieDB from a Reader if available.
+// This is used for merging read tracking data between reader and commit tries
+// for complete witness generation in TDB mode.
+// Returns nil if no TrieDB is found.
+func ExtractTrieDB(r Reader) *trie.TrieDB {
+	if r == nil {
+		return nil
+	}
+	// Try direct reader type
+	if rd, ok := r.(*reader); ok {
+		return rd.GetTrieDB()
+	}
+	// Try readerWithCache
+	if rwc, ok := r.(*readerWithCache); ok {
+		if rd, ok := rwc.Reader.(*reader); ok {
+			return rd.GetTrieDB()
+		}
+	}
+	// Try readerWithCacheStats
+	if rwcs, ok := r.(*readerWithCacheStats); ok {
+		if rd, ok := rwcs.Reader.(*reader); ok {
+			return rd.GetTrieDB()
+		}
+	}
+	return nil
 }
